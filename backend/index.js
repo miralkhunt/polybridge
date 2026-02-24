@@ -1,8 +1,23 @@
-const express = require('express');
-const cors = require('cors');
+import express from 'express';
+import cors from 'cors';
+import { ClobClient, Side, OrderType } from "@polymarket/clob-client";
+import { Wallet } from "ethers"; // v5.8.0
 
-const dotenv = require('dotenv');
-dotenv.config();
+import { config } from 'dotenv';
+config();
+
+
+const signer = new Wallet(process.env.WALLET_PRIVATE_KEY);
+const tempClient = new ClobClient("https://clob.polymarket.com", 137, signer);
+const apiCreds = await tempClient.createOrDeriveApiKey();
+const client = new ClobClient(
+  "https://clob.polymarket.com",
+  137,
+  signer,
+  apiCreds,
+  2,
+  process.env.POLY_ADDRESS,
+);
 
 const app = express();
 
@@ -143,6 +158,59 @@ app.get("/events/:id", async (req, res) => {
     });
   }
 });
+
+const CLOB_API_URL = process.env.CLOB_API_URL || 'https://clob.polymarket.com';
+
+app.get("/orderbook", async (req, res) => {
+  const tokenId = req.query.token_id?.trim();
+  if (!tokenId) {
+    return res.status(400).json({ error: "Query parameter 'token_id' is required" });
+  }
+  try {
+    const url = `${CLOB_API_URL}/book?token_id=${encodeURIComponent(tokenId)}`;
+    const data = await fetchWithRetry(url, { retries: 1, timeoutMs: 8000 });
+    if (!data.ok) {
+      const errBody = await data.text();
+      return res.status(data.status).json({
+        error: data.status === 404 ? "No orderbook for this token" : "Failed to fetch orderbook",
+        details: errBody || undefined,
+      });
+    }
+    const json = await data.json();
+    return res.json(json);
+  } catch (err) {
+    const timedOut = err.name === 'AbortError';
+    return res.status(timedOut ? 504 : 500).json({
+      error: timedOut ? "Orderbook request timed out" : "Failed to fetch orderbook",
+      message: err.message,
+    });
+  }
+});
+
+
+app.get("/marketbuy", async (req, res) => {
+  const tokenId = req.query.tokenId?.trim();
+  const amount = req.query.amount?.trim();
+  const side = req.query.side?.trim();
+  // const price = req.query.price?.trim();
+  const tickSize = await client.getTickSize(tokenId);
+  const isNegRisk = await client.getNegRisk(tokenId);
+
+  const response = await client.createAndPostMarketOrder(
+    {
+      tokenID: tokenId,
+      side: side.toLowerCase() === "buy" ? Side.BUY : Side.SELL,
+      amount: amount,
+      // price: price,
+    },
+    { tickSize: tickSize, negRisk: isNegRisk },
+    OrderType.FOK,
+  );
+
+  return res.send(response);
+})
+
+
 
 app.listen(3000, () => {
   console.log('Server running at http://localhost:3000');

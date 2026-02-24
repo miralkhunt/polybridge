@@ -26,6 +26,12 @@ const fmt = (n) => {
 };
 
 const pct = (price) => Math.round(parseFloat(price || 0) * 100);
+
+// Order book: asks ascending (best ask = lowest price first), bids descending (best bid first)
+const sortAsks = (asks) =>
+  (asks || []).slice().sort((a, b) => parseFloat(a.price || 0) - parseFloat(b.price || 0));
+const sortBids = (bids) =>
+  (bids || []).slice().sort((a, b) => parseFloat(b.price || 0) - parseFloat(a.price || 0));
 const normalizeWsPrice = (value) => {
   const num = parseFloat(value);
   if (Number.isNaN(num)) return null;
@@ -99,11 +105,29 @@ const setCachedEventDetail = (id, data) => {
   eventDetailCache.set(id, { data, ts: Date.now() });
 };
 
-// ─── EventDetailModal ────────────────────────────────────────────────────────
-function EventDetailModal({ eventId, seedEvent, liveEvent, onClose }) {
+const API_BASE = "http://localhost:3000";
+
+// ─── EventDetailModal (Trading view with order book) ──────────────────────────
+function EventDetailModal({
+  eventId,
+  seedEvent,
+  liveEvent,
+  onClose,
+  orderbookByTokenId,
+  selectedOutcomeTokenId,
+  setSelectedOutcomeTokenId,
+  onFetchOrderbook,
+  orderbookTab,
+  setOrderbookTab,
+  tradeSide,
+  setTradeSide,
+  tradeAmount,
+  setTradeAmount,
+}) {
   const [detail, setDetail] = useState(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  const [orderbookLoading, setOrderbookLoading] = useState(false);
 
   useEffect(() => {
     if (!eventId) return;
@@ -158,59 +182,138 @@ function EventDetailModal({ eventId, seedEvent, liveEvent, onClose }) {
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  // Use liveEvent as primary source if available, fallback to detail
   const effectiveDetail = liveEvent || detail;
-  
+
   const mergedMarkets = useMemo(() => {
     if (!effectiveDetail?.markets?.length) return [];
-    return effectiveDetail.markets.map((market) => {
+    return effectiveDetail.markets.map((m) => ({ ...m }));
+  }, [effectiveDetail]);
+
+  // Order markets so Moneyline is first (matches Polymarket Order Book)
+  const sortedMarkets = useMemo(() => {
+    const list = [...mergedMarkets];
+    list.sort((a, b) => {
+      const at = (a.sportsMarketType || a.marketType || "").toLowerCase();
+      const bt = (b.sportsMarketType || b.marketType || "").toLowerCase();
+      if (at === "moneyline") return -1;
+      if (bt === "moneyline") return 1;
+      if (at === "spread") return -1;
+      if (bt === "spread") return 1;
+      return 0;
+    });
+    return list;
+  }, [mergedMarkets]);
+
+  // Flatten outcome options with Moneyline first (uses sortedMarkets)
+  const outcomeOptions = useMemo(() => {
+    const out = [];
+    sortedMarkets.forEach((market) => {
       const outcomes = parseList(market.outcomes);
       const tokens = parseList(market.clobTokenIds);
       const prices = parseList(market.outcomePrices);
-      
-      // Debug: Log token-to-outcome mapping for verification
-      if (market.question?.includes('India') || market.question?.includes('South Africa')) {
-        console.log(`[WS Debug] Market: ${market.question}`);
-        console.log(`[WS Debug] Outcomes:`, outcomes);
-        console.log(`[WS Debug] Token IDs:`, tokens);
-        console.log(`[WS Debug] Prices:`, prices);
-        outcomes.forEach((outcome, idx) => {
-          console.log(`[WS Debug]   ${outcome} (index ${idx}) -> Token: ${tokens[idx] || 'N/A'} -> Price: ${prices[idx] || 'N/A'}`);
-        });
-      }
-      
-      return market;
+      outcomes.forEach((label, i) => {
+        const tokenId = tokens[i];
+        if (tokenId) out.push({ market, label, tokenId, price: prices[i], outcomeIndex: i });
+      });
     });
-  }, [effectiveDetail]);
+    return out;
+  }, [sortedMarkets]);
+
+  const selectedOption = useMemo(
+    () => outcomeOptions.find((o) => o.tokenId === selectedOutcomeTokenId),
+    [outcomeOptions, selectedOutcomeTokenId]
+  );
+  const selectedOutcomeLabel = selectedOption?.label ?? "—";
+  const orderbook = selectedOutcomeTokenId ? orderbookByTokenId[String(selectedOutcomeTokenId)] : null;
+
+  const handleMarketBuy = async (e, tradeAmount, selectedOutcomeTokenId, tradeSide) => {
+    const res = await fetch("http://localhost:3000/marketbuy?tokenId=" + selectedOutcomeTokenId + "&amount=" + tradeAmount + "&side=" + tradeSide);
+    const data = await res.json();
+    alert(JSON.stringify(data));
+  }
+
+  // Live price: Buy = best ask (price to buy), Sell = best bid (price to sell); fallback to outcome price or last trade
+  const getLivePriceForOutcome = useCallback(
+    (tokenId, fallbackPrice) => {
+      const ob = orderbookByTokenId[String(tokenId)];
+      if (tradeSide === "buy") {
+        const ask = ob?.best_ask ?? (ob?.asks?.length ? ob.asks[0]?.price : undefined);
+        return ask != null ? parseFloat(ask) : parseFloat(fallbackPrice) ?? null;
+      }
+      const bid = ob?.best_bid ?? ob?.bids?.[0]?.price;
+      return bid != null ? parseFloat(bid) : parseFloat(fallbackPrice) ?? null;
+    },
+    [orderbookByTokenId, tradeSide]
+  );
+
+  const avgPrice =
+    selectedOutcomeTokenId && orderbook
+      ? tradeSide === "buy"
+        ? parseFloat(orderbook.best_ask ?? (orderbook.asks?.length ? orderbook.asks[0]?.price : undefined) ?? orderbook.last_trade_price) || parseFloat(selectedOption?.price) || null
+        : parseFloat(orderbook.best_bid ?? orderbook.bids?.[0]?.price ?? orderbook.last_trade_price) || parseFloat(selectedOption?.price) || null
+      : selectedOption
+        ? parseFloat(selectedOption.price)
+        : orderbook?.last_trade_price
+          ? parseFloat(orderbook.last_trade_price)
+          : null;
+
+  const amountNum = Number(tradeAmount) || 0;
+  const toWin = tradeSide === "buy" && avgPrice != null && avgPrice > 0 && amountNum > 0
+    ? (amountNum / avgPrice).toFixed(2)
+    : tradeSide === "sell" && avgPrice != null && amountNum > 0
+      ? (amountNum * avgPrice).toFixed(2)
+      : "0.00";
+
+  useEffect(() => {
+    if (!effectiveDetail || outcomeOptions.length === 0) return;
+    const ids = outcomeOptions.map((o) => o.tokenId);
+    if (!selectedOutcomeTokenId || !ids.includes(selectedOutcomeTokenId)) {
+      setSelectedOutcomeTokenId(outcomeOptions[0]?.tokenId ?? null);
+    }
+  }, [effectiveDetail?.id, outcomeOptions]);
+
+  useEffect(() => {
+    if (!selectedOutcomeTokenId || orderbookByTokenId[selectedOutcomeTokenId]) return;
+    let cancelled = false;
+    setOrderbookLoading(true);
+    onFetchOrderbook(selectedOutcomeTokenId)
+      .then(() => { if (!cancelled) setOrderbookLoading(false); })
+      .catch(() => { if (!cancelled) setOrderbookLoading(false); });
+    return () => { cancelled = true; };
+  }, [selectedOutcomeTokenId, orderbookByTokenId, onFetchOrderbook]);
+
+  const addAmount = (delta) => setTradeAmount((prev) => Math.max(0, (parseFloat(prev) || 0) + delta));
+  const maxAmount = 10000;
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-start justify-center bg-black/70 backdrop-blur-sm overflow-y-auto py-8 px-4"
+      className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm overflow-y-auto py-4 px-4"
       onClick={handleBackdrop}
     >
-      <div className="relative bg-[#12161c] border border-gray-700 rounded-2xl w-full max-w-3xl shadow-2xl">
-        {/* close button */}
+      <div
+        className="relative bg-[#0f1419] border border-gray-800 rounded-2xl w-full max-w-5xl shadow-2xl overflow-hidden"
+        onClick={(e) => e.stopPropagation()}
+      >
         <button
           onClick={onClose}
-          className="absolute top-4 right-4 text-gray-400 hover:text-white transition-colors z-10"
+          className="absolute top-4 right-4 z-10 text-gray-400 hover:text-white transition-colors p-1 rounded"
+          aria-label="Close"
         >
           <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M6 18L18 6M6 6l12 12" />
           </svg>
         </button>
 
-        {/* loading */}
         {loading && !effectiveDetail && (
           <div className="flex flex-col items-center justify-center py-24 gap-4">
             <svg className="animate-spin h-10 w-10 text-blue-500" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z" />
             </svg>
-            <p className="text-gray-400 text-sm">Loading event details…</p>
+            <p className="text-gray-400 text-sm">Loading event…</p>
           </div>
         )}
 
-        {/* error */}
         {error && (
           <div className="p-8 text-center">
             <p className="text-red-400 font-medium">{error}</p>
@@ -218,117 +321,260 @@ function EventDetailModal({ eventId, seedEvent, liveEvent, onClose }) {
           </div>
         )}
 
-        {/* content */}
         {effectiveDetail && (
-          <>
-            {/* hero */}
-            <div className="flex gap-4 p-6 border-b border-gray-800">
-              <img
-                src={effectiveDetail.image || effectiveDetail.icon || `https://ui-avatars.com/api/?name=${encodeURIComponent(effectiveDetail.title)}&background=1e2329&color=fff`}
-                alt={effectiveDetail.title}
-                className="w-16 h-16 rounded-xl object-cover bg-gray-800 shrink-0"
-                onError={(e) => { e.target.onerror = null; e.target.src = `https://ui-avatars.com/api/?name=E&background=1e2329&color=fff`; }}
-              />
-              <div className="flex-1 min-w-0">
-                <h2 className="text-xl font-bold text-white leading-snug mb-1">{effectiveDetail.title}</h2>
-                <div className="flex flex-wrap gap-2 text-xs text-gray-400">
-                  {effectiveDetail.tags?.map((t) => (
-                    <span key={t.id} className="bg-gray-800 px-2 py-0.5 rounded-full">{t.label}</span>
-                  ))}
+          <div className="grid grid-cols-1 lg:grid-cols-[1fr,320px] min-h-[520px]">
+            {/* Left: Event + Order Book */}
+            <div className="flex flex-col border-r border-gray-800">
+              {/* Event header */}
+              <div className="p-4 border-b border-gray-800">
+                <div className="flex items-center gap-2 flex-wrap">
+                  <span className="text-sm text-gray-400">{effectiveDetail.category || "League of Legends"}</span>
+                  {effectiveDetail.live && (
+                    <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded bg-red-600/20 text-red-400 text-xs font-medium">
+                      <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse" /> LIVE
+                    </span>
+                  )}
+                  <span className="text-sm text-gray-500">Game 1 • Best of 5</span>
+                </div>
+                <p className="mt-1 text-sm text-gray-300">
+                  {fmt(effectiveDetail.volume)} Vol. {effectiveDetail.title}
+                </p>
+                <button type="button" className="mt-2 flex items-center gap-1.5 text-gray-400 hover:text-white text-sm transition-colors">
+                  <span className="inline-flex items-center justify-center w-6 h-6 rounded bg-gray-700 text-xs">B</span>
+                  Game View &gt;
+                </button>
+              </div>
+
+              {/* Market options (Moneyline first to match Polymarket Order Book) */}
+              <div className="p-4 border-b border-gray-800">
+                <div className="flex flex-wrap gap-3">
+                  {[...mergedMarkets]
+                    .sort((a, b) => {
+                      const at = (a.sportsMarketType || a.marketType || "").toLowerCase();
+                      const bt = (b.sportsMarketType || b.marketType || "").toLowerCase();
+                      if (at === "moneyline") return -1;
+                      if (bt === "moneyline") return 1;
+                      if (at === "spread") return -1;
+                      if (bt === "spread") return 1;
+                      return 0;
+                    })
+                    .slice(0, 3)
+                    .map((market) => {
+                      const outcomes = parseList(market.outcomes);
+                      const tokens = parseList(market.clobTokenIds);
+                      const prices = parseList(market.outcomePrices);
+                      const marketType = market.sportsMarketType || market.question?.toLowerCase().slice(0, 6) || "market";
+                      return (
+                        <div key={market.id} className="flex flex-col gap-1.5">
+                          <span className="text-xs text-gray-500 uppercase tracking-wide">{marketType}</span>
+                          <div className="flex gap-2 flex-wrap">
+                            {outcomes.map((outcome, i) => {
+                              const tokenId = tokens[i];
+                              const ob = tokenId ? orderbookByTokenId[String(tokenId)] : null;
+                              const livePrice = ob?.best_ask ?? (ob?.asks?.length ? ob.asks[0]?.price : undefined) ?? ob?.last_trade_price ?? prices[i];
+                              const p = pct(livePrice);
+                              const isSelected = selectedOutcomeTokenId === tokenId;
+                              return (
+                                <button
+                                  key={`${market.id}-${i}`}
+                                  type="button"
+                                  onClick={() => {
+                                    setSelectedOutcomeTokenId(tokenId);
+                                    if (!orderbookByTokenId[String(tokenId)]) onFetchOrderbook(tokenId);
+                                  }}
+                                  className={`px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors ${i === 0
+                                    ? isSelected
+                                      ? "bg-red-600/30 border-red-500 text-red-300"
+                                      : "bg-gray-800 border-gray-700 text-red-300 hover:border-red-900"
+                                    : isSelected
+                                      ? "bg-red-600/30 border-red-500 text-red-300"
+                                      : "bg-gray-800 border-gray-700 text-gray-300 hover:border-gray-600"
+                                    }`}
+                                >
+                                  {outcome} {p}¢
+                                </button>
+                              );
+                            })}
+                          </div>
+                        </div>
+                      );
+                    })}
                 </div>
               </div>
-            </div>
-            {loading && (
-              <div className="px-6 py-2 text-xs text-blue-300 border-b border-gray-800 bg-blue-900/10">
-                Refreshing full event details...
+
+              {/* Order Book / Graph tabs */}
+              <div className="flex items-center gap-4 px-4 pt-3 border-b border-gray-800">
+                <button
+                  type="button"
+                  onClick={() => setOrderbookTab("book")}
+                  className={`pb-3 text-sm font-medium transition-colors border-b-2 ${orderbookTab === "book" ? "text-blue-400 border-blue-500" : "text-gray-500 border-transparent hover:text-gray-300"
+                    }`}
+                >
+                  Order Book
+                </button>
+
               </div>
-            )}
 
-            {/* stats row */}
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-px bg-gray-800 border-b border-gray-800">
-              {[
-                { label: "Total Volume", value: fmt(effectiveDetail.volume) },
-                { label: "Liquidity", value: fmt(effectiveDetail.liquidity) },
-                { label: "24h Volume", value: fmt(effectiveDetail.volume24hr) },
-                { label: "Status", value: effectiveDetail.closed ? "Closed" : effectiveDetail.active ? "Active" : "Inactive" },
-              ].map(({ label, value }) => (
-                <div key={label} className="bg-[#12161c] px-4 py-4 text-center">
-                  <p className="text-xs text-gray-500 mb-1">{label}</p>
-                  <p className="text-base font-bold text-white">{value}</p>
-                </div>
-              ))}
-            </div>
-
-            {/* markets */}
-            <div className="p-6">
-              <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-4">
-                Markets ({mergedMarkets.length})
-              </h3>
-              <div className="flex flex-col gap-4">
-                {mergedMarkets.map((market) => {
-                  const outcomes = parseList(market.outcomes);
-                  const prices = parseList(market.outcomePrices);
-
-                  return (
-                    <div key={market.id} className="bg-[#1e2329] rounded-xl border border-gray-800 p-4">
-                      <div className="flex justify-between items-start gap-2 mb-4">
-                        <p className="text-sm font-semibold text-gray-100 leading-snug">{market.question}</p>
-                        <span className={`text-xs px-2 py-0.5 rounded-full shrink-0 font-medium ${
-                          market.closed
-                            ? "bg-gray-700 text-gray-400"
-                            : market.active
-                            ? "bg-green-900/50 text-green-400"
-                            : "bg-yellow-900/50 text-yellow-400"
-                        }`}>
-                          {market.closed ? "Closed" : market.active ? "Active" : "Pending"}
-                        </span>
-                      </div>
-
-                      {/* outcome buttons */}
-                      <div className="flex gap-2 flex-wrap mb-4">
-                        {outcomes.map((outcome, i) => {
-                          const p = pct(prices[i]);
-                          const isFirst = i === 0;
-                          return (
-                            <button
-                              key={outcome}
-                              className={`flex-1 min-w-[80px] flex items-center justify-between px-3 py-2 rounded-lg text-sm font-medium border transition-colors ${
-                                isFirst
-                                  ? "bg-[#1a3a29] hover:bg-[#1f4532] text-[#4ade80] border-[#2a523a]"
-                                  : "bg-[#3a1a1a] hover:bg-[#451f1f] text-[#f87171] border-[#522a2a]"
-                              }`}
-                            >
-                              <span>{outcome}</span>
-                              <span className="ml-2 opacity-80">{p}¢</span>
-                            </button>
-                          );
-                        })}
-                      </div>
-
-                      {/* market stats */}
-                      <div className="flex items-center gap-4 text-xs text-gray-500 pt-3 border-t border-gray-800">
-                        <span>Vol: <span className="text-gray-300">{fmt(market.volumeNum)}</span></span>
-                        <span>Liq: <span className="text-gray-300">{fmt(market.liquidityNum)}</span></span>
-                        {market.lastTradePrice != null && (
-                          <span>Last: <span className="text-gray-300">{pct(market.lastTradePrice)}¢</span></span>
-                        )}
+              {/* Order book table */}
+              <div className="flex-1 overflow-auto p-4">
+                {orderbookTab === "book" && (
+                  <>
+                    <div className="flex items-center justify-between mb-3">
+                      <span className="text-sm font-semibold text-white">TRADE {selectedOutcomeLabel}</span>
+                      <div className="flex gap-1">
+                        <button type="button" className="p-1.5 text-gray-500 hover:text-white" aria-label="Filter">
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M3 4a1 1 0 011-1h16a1 1 0 011 1v2.586a1 1 0 01-.293.707l-6.414 6.414a1 1 0 00-.293.707V17l-4 4v-6.586a1 1 0 00-.293-.707L3.293 7.293A1 1 0 013 6.586V4z" />
+                          </svg>
+                        </button>
+                        <button type="button" className="p-1.5 text-gray-500 hover:text-white" aria-label="Sort">
+                          <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M7 16V4m0 0L3 8m4-4l4 4m6 0v12m0 0l4-4m-4 4l-4-4" />
+                          </svg>
+                        </button>
                       </div>
                     </div>
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-gray-500 text-left border-b border-gray-800">
+                          <th className="pb-2 font-medium">PRICE</th>
+                          <th className="pb-2 font-medium text-right">SHARES</th>
+                          <th className="pb-2 font-medium text-right">TOTAL</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        {orderbookLoading && !orderbook && (
+                          <tr><td colSpan={3} className="py-8 text-center text-gray-500">Loading order book…</td></tr>
+                        )}
+                        {!orderbookLoading && orderbook && (
+                          <>
+                            {sortAsks(orderbook.asks).slice(0, 8).reverse().map((row, i) => {
+                              const price = parseFloat(row.price);
+                              const size = parseFloat(row.size);
+                              const total = price * size;
+                              return (
+                                <tr key={`ask-${i}`} className="border-b border-gray-800/50">
+                                  <td className="py-1.5 text-red-400 font-medium">{pct(price)}¢</td>
+                                  <td className="py-1.5 text-right text-gray-300">{size.toFixed(2)}</td>
+                                  <td className="py-1.5 text-right text-gray-400">${total.toFixed(2)}</td>
+                                </tr>
+                              );
+                            })}
+                            <tr className="bg-gray-800/30">
+                              <td colSpan={3} className="py-2 px-2 text-xs text-gray-400">
+                                Last: {orderbook.last_trade_price != null ? `${pct(orderbook.last_trade_price)}¢` : "—"} &nbsp; Spread: {orderbook.spread != null ? `${pct(orderbook.spread)}¢` : "—"}
+                              </td>
+                            </tr>
+                            {sortBids(orderbook.bids).slice(0, 8).map((row, i) => {
+                              const price = parseFloat(row.price);
+                              const size = parseFloat(row.size);
+                              const total = price * size;
+                              return (
+                                <tr key={`bid-${i}`} className="border-b border-gray-800/50">
+                                  <td className="py-1.5 text-green-400 font-medium">{pct(price)}¢</td>
+                                  <td className="py-1.5 text-right text-gray-300">{size.toFixed(2)}</td>
+                                  <td className="py-1.5 text-right text-gray-400">${total.toFixed(2)}</td>
+                                </tr>
+                              );
+                            })}
+                          </>
+                        )}
+                        {!orderbookLoading && selectedOutcomeTokenId && !orderbook && (
+                          <tr><td colSpan={3} className="py-8 text-center text-gray-500">No order book data</td></tr>
+                        )}
+                        {!selectedOutcomeTokenId && (
+                          <tr><td colSpan={3} className="py-8 text-center text-gray-500">Select a market to view order book</td></tr>
+                        )}
+                      </tbody>
+                    </table>
+                  </>
+                )}
+              </div>
+            </div>
+
+            {/* Right: Trade panel */}
+            <div className="flex flex-col bg-[#12161c] p-5 border-t lg:border-t-0 lg:border-l border-gray-800">
+              <div className="flex gap-2 mb-4">
+                <button
+                  type="button"
+                  onClick={() => setTradeSide("buy")}
+                  className={`flex-1 py-2 rounded-lg text-sm font-medium transition-colors ${tradeSide === "buy" ? "bg-blue-600 text-white" : "bg-gray-800 text-gray-400 hover:text-gray-200"
+                    }`}
+                >
+                  Buy
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setTradeSide("sell")}
+                  className={`flex-1 py-2 rounded-lg text-sm font-medium transition-colors ${tradeSide === "sell" ? "bg-blue-600 text-white" : "bg-gray-800 text-gray-400 hover:text-gray-200"
+                    }`}
+                >
+                  Sell
+                </button>
+              </div>
+              <div className="mb-2 text-sm text-gray-500">Market</div>
+              <div className="flex gap-2 mb-4">
+                {outcomeOptions.slice(0, 2).map((o) => {
+                  const isSelected = selectedOutcomeTokenId === o.tokenId;
+                  const livePrice = getLivePriceForOutcome(o.tokenId, o.price);
+                  const p = livePrice != null ? pct(livePrice) : pct(o.price);
+                  return (
+                    <button
+                      key={o.tokenId}
+                      type="button"
+                      onClick={() => setSelectedOutcomeTokenId(o.tokenId)}
+                      className={`flex-1 py-2.5 rounded-lg text-sm font-medium border transition-colors ${isSelected ? "bg-red-600/20 border-red-500 text-red-300 shadow-md" : "bg-gray-800 border-gray-700 text-gray-300 hover:border-gray-600"
+                        }`}
+                    >
+                      {o.label} {p}¢
+                    </button>
                   );
                 })}
               </div>
-            </div>
-
-            {/* description */}
-            {effectiveDetail.description && (
-              <div className="px-6 pb-6">
-                <h3 className="text-sm font-semibold text-gray-400 uppercase tracking-wider mb-3">About</h3>
-                <p className="text-sm text-gray-400 leading-relaxed whitespace-pre-line line-clamp-6">
-                  {effectiveDetail.description}
-                </p>
+              <label className="block text-sm text-gray-500 mb-1">Amount</label>
+              <input
+                type="number"
+                min={0}
+                step={1}
+                value={tradeAmount}
+                onChange={(e) => setTradeAmount(Math.max(0, parseFloat(e.target.value) || 0))}
+                className="w-full mb-2 px-3 py-2 rounded-lg bg-gray-800 border border-gray-700 text-white text-2xl font-bold focus:ring-2 focus:ring-blue-500 focus:border-blue-500"
+              />
+              <div className="flex flex-wrap gap-2 mb-4">
+                {[1, 5, 10, 100].map((n) => (
+                  <button key={n} type="button" onClick={() => addAmount(n)} className="px-3 py-1.5 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 text-sm font-medium">
+                    +${n}
+                  </button>
+                ))}
+                <button type="button" onClick={() => setTradeAmount(maxAmount)} className="px-3 py-1.5 rounded-lg bg-gray-800 text-gray-300 hover:bg-gray-700 text-sm font-medium">
+                  Max
+                </button>
               </div>
-            )}
-          </>
+              <div className="flex items-center gap-2 text-sm text-gray-400 mb-1">
+                <span>To win</span>
+                <svg className="w-4 h-4 text-green-500" fill="currentColor" viewBox="0 0 20 20">
+                  <path d="M8.433 7.418c.155-.103.346-.196.567-.267v1.698a2.305 2.305 0 01-.567-.267C8.07 8.34 8 8.114 8 8c0-.114.07-.34.433-.582zM11 12.849v-1.698c.22.071.412.164.567.267.364.243.433.468.433.582 0 .114-.07.34-.433.582a2.305 2.305 0 01-.567.267z" />
+                  <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm1-13a1 1 0 10-2 0v.092a4.535 4.535 0 00-1.676.662C6.602 6.234 6 7.009 6 8c0 .99.602 1.765 1.324 2.246.48.32 1.054.545 1.676.662v1.941c-.391-.127-.68-.317-.843-.504a1 1 0 10-1.51 1.31c.562.649 1.413 1.076 2.353 1.253V15a1 1 0 102 0v-.092a4.535 4.535 0 001.676-.662C13.398 13.765 14 12.991 14 12c0-.99-.602-1.765-1.324-2.246A4.535 4.535 0 0011 9.092V7.151c.391.127.68.317.843.504a1 1 0 101.511-1.31c-.563-.649-1.413-1.076-2.354-1.253V5z" clipRule="evenodd" />
+                </svg>
+              </div>
+              <div className="text-2xl font-bold text-green-400 mb-2">${toWin}</div>
+              {avgPrice != null && (
+                <p className="text-xs text-gray-500 mb-4 flex items-center gap-1">
+                  Avg. Price {pct(avgPrice)}¢
+                  <span className="inline-flex items-center justify-center w-3.5 h-3.5 rounded-full bg-gray-600 text-gray-400 cursor-help" title="Price info">ⓘ</span>
+                </p>
+              )}
+              <button type="button"
+                id="1"
+                onClick={(e) => handleMarketBuy(e, tradeAmount, selectedOutcomeTokenId, tradeSide)}
+                className="w-full py-3 rounded-lg bg-blue-600 hover:bg-blue-500 text-white font-semibold transition-colors">
+                Trade
+              </button>
+              <p className="mt-4 text-xs text-gray-500">
+                By trading, you agree to the <a href="#" className="text-blue-400 hover:underline">Terms of Use</a>.
+              </p>
+            </div>
+          </div>
         )}
       </div>
     </div>
@@ -344,10 +590,16 @@ function App() {
   const [hasSearched, setHasSearched] = useState(false);
   const [selectedEvent, setSelectedEvent] = useState(null);
   const [wsStatus, setWsStatus] = useState("offline");
+  const [orderbookByTokenId, setOrderbookByTokenId] = useState({});
+  const [selectedOutcomeTokenId, setSelectedOutcomeTokenId] = useState(null);
+  const [orderbookTab, setOrderbookTab] = useState("book");
+  const [tradeSide, setTradeSide] = useState("buy");
+  const [tradeAmount, setTradeAmount] = useState(1);
   const tokenMapRef = useRef(new Map());
   const tokenIdsRef = useRef([]);
 
   useEffect(() => { fetchEvents(); }, []);
+
 
   const fetchEvents = async () => {
     setLoading(true);
@@ -426,7 +678,31 @@ function App() {
     }
   };
 
-  const closeModal = useCallback(() => setSelectedEvent(null), []);
+  const closeModal = useCallback(() => {
+    setSelectedEvent(null);
+    setSelectedOutcomeTokenId(null);
+    setTradeAmount(1);
+  }, []);
+
+  const fetchOrderbook = useCallback(async (tokenId) => {
+    const id = String(tokenId);
+    const r = await fetch(`${API_BASE}/orderbook?token_id=${encodeURIComponent(id)}`);
+    if (!r.ok) throw new Error("Failed to fetch orderbook");
+    const data = await r.json();
+    const asks = sortAsks(data.asks);
+    const bids = sortBids(data.bids);
+    setOrderbookByTokenId((prev) => ({
+      ...prev,
+      [id]: {
+        bids,
+        asks,
+        last_trade_price: data.last_trade_price ?? null,
+        spread: data.spread ?? (asks.length && bids.length
+          ? (parseFloat(asks[0].price) - parseFloat(bids[0].price)).toFixed(4)
+          : null),
+      },
+    }));
+  }, []);
 
   const { tokenIds, tokenMap } = useMemo(() => {
     const ids = [];
@@ -450,7 +726,7 @@ function App() {
       preferredEvent.markets.forEach((market) => {
         const tokens = parseList(market.clobTokenIds);
         const outcomes = parseList(market.outcomes);
-        
+
         // Debug: Log token-to-outcome mapping for selected event
         if (market.question?.includes('India') || market.question?.includes('South Africa')) {
           console.log(`[WS Subscribe] Selected Market: ${market.question}`);
@@ -460,7 +736,7 @@ function App() {
             console.log(`[WS Subscribe]   ${outcome} (index ${idx}) -> Token: ${tokens[idx] || 'MISSING'}`);
           });
         }
-        
+
         tokens.forEach((tokenId, outcomeIndex) => {
           const id = String(tokenId || "").trim();
           if (!id) return;
@@ -539,32 +815,109 @@ function App() {
         if (stopped) return;
         setWsStatus("live");
         reconnectDelay = 1000;
-        
+
         const subscribePayload = {
-          type: "subscribe",
-          channel: "market",
           assets_ids: tokenIdsRef.current,
+          type: "market",
+          custom_feature_enabled: true,
         };
-        
-        console.log(`[WS] ✅ Connected to WebSocket`);
-        console.log(`[WS] Subscribing to ${tokenIdsRef.current.length} token IDs`);
-        console.log(`[WS] First 5 token IDs:`, tokenIdsRef.current.slice(0, 5));
-        
-        // Log token mappings for debugging
-        const allMappings = Array.from(tokenMapRef.current.entries());
-        if (allMappings.length > 0) {
-          console.log(`[WS] Found ${allMappings.length} token mappings`);
-          allMappings.slice(0, 3).forEach(([tokenId, mappings]) => {
-            console.log(`[WS]   Token ${tokenId.substring(0, 20)}... maps to ${mappings.length} target(s):`, mappings.slice(0, 2));
+        ws.send(JSON.stringify(subscribePayload));
+      };
+
+      const processOrderbookMessage = (msg) => {
+        const et = msg?.event_type ?? msg?.eventType;
+        const aid = msg?.asset_id ?? msg?.assetId;
+        const assetId = aid != null ? String(aid) : null;
+
+        if (et === "book" && assetId) {
+          setOrderbookByTokenId((prev) => {
+            const cur = prev[assetId] || {};
+            const asks = sortAsks(msg.asks);
+            const bids = sortBids(msg.bids);
+            const spread = asks.length && bids.length
+              ? (parseFloat(asks[0].price) - parseFloat(bids[0].price)).toFixed(4)
+              : cur.spread;
+            return {
+              ...prev,
+              [assetId]: {
+                bids,
+                asks,
+                last_trade_price: msg.last_trade_price ?? cur.last_trade_price,
+                spread: msg.spread ?? spread,
+              },
+            };
+          });
+        } else if (et === "last_trade_price" && assetId) {
+          setOrderbookByTokenId((prev) => {
+            const cur = prev[assetId] || {};
+            return {
+              ...prev,
+              [assetId]: { ...cur, last_trade_price: msg.price ?? cur.last_trade_price },
+            };
+          });
+        } else if (et === "best_bid_ask" && assetId) {
+          setOrderbookByTokenId((prev) => {
+            const cur = prev[assetId] || {};
+            return {
+              ...prev,
+              [assetId]: {
+                ...cur,
+                best_bid: msg.best_bid ?? cur.best_bid,
+                best_ask: msg.best_ask ?? cur.best_ask,
+                spread: msg.spread ?? cur.spread,
+              },
+            };
+          });
+        } else if (et === "price_change" && msg.price_changes?.length) {
+          setOrderbookByTokenId((prev) => {
+            let next = { ...prev };
+            msg.price_changes.forEach((pc) => {
+              const rawId = pc.asset_id ?? pc.assetId;
+              if (rawId == null) return;
+              const aidStr = String(rawId);
+              const cur = next[aidStr] || {};
+              const bids = cur.bids ? [...cur.bids] : [];
+              const asks = cur.asks ? [...cur.asks] : [];
+              const price = String(pc.price ?? "");
+              const size = String(pc.size ?? "0");
+              const side = (pc.side || "").toUpperCase();
+              if (side === "BUY") {
+                const idx = bids.findIndex((l) => String(l.price) === price);
+                if (parseFloat(size) === 0) {
+                  if (idx >= 0) bids.splice(idx, 1);
+                } else {
+                  if (idx >= 0) bids[idx] = { price, size };
+                  else bids.push({ price, size });
+                  bids.sort((a, b) => parseFloat(b.price) - parseFloat(a.price));
+                }
+              } else {
+                const idx = asks.findIndex((l) => String(l.price) === price);
+                if (parseFloat(size) === 0) {
+                  if (idx >= 0) asks.splice(idx, 1);
+                } else {
+                  if (idx >= 0) asks[idx] = { price, size };
+                  else asks.push({ price, size });
+                  asks.sort((a, b) => parseFloat(a.price) - parseFloat(b.price));
+                }
+              }
+              const spread = asks.length && bids.length
+                ? (parseFloat(asks[0].price) - parseFloat(bids[0].price)).toFixed(4)
+                : cur.spread;
+              next = {
+                ...next,
+                [aidStr]: {
+                  ...cur,
+                  bids,
+                  asks,
+                  best_bid: pc.best_bid ?? cur.best_bid,
+                  best_ask: pc.best_ask ?? cur.best_ask,
+                  spread,
+                },
+              };
+            });
+            return next;
           });
         }
-        
-        console.log(`[WS] Subscribe payload:`, JSON.stringify({
-          ...subscribePayload,
-          assets_ids: subscribePayload.assets_ids.slice(0, 3).map(id => id.substring(0, 20) + '...')
-        }));
-        
-        ws.send(JSON.stringify(subscribePayload));
       };
 
       ws.onmessage = (evt) => {
@@ -572,24 +925,16 @@ function App() {
         try {
           payload = JSON.parse(evt.data);
         } catch {
-          console.log(`[WS] Failed to parse message:`, evt.data);
           return;
         }
 
-        // Log raw messages for debugging
-        if (Array.isArray(payload) && payload.length > 0) {
-          console.log(`[WS] Received message with ${payload.length} items`);
-        } else if (typeof payload === 'object') {
-          console.log(`[WS] Received message:`, Object.keys(payload));
+        const messages = Array.isArray(payload) ? payload : [payload];
+        for (const msg of messages) {
+          processOrderbookMessage(msg);
         }
 
         const updates = extractWsPriceUpdates(payload);
-        if (!updates.length) {
-          console.log(`[WS] No price updates extracted from message`);
-          return;
-        }
-        
-        console.log(`[WS] Extracted ${updates.length} price updates:`, updates.map(u => ({ assetId: u.assetId, price: u.price })));
+        if (!updates.length) return;
 
         setEvents((prev) => {
           const eventIndexById = new Map(
@@ -615,15 +960,8 @@ function App() {
           updates.forEach((update) => {
             const assetIdStr = String(update.assetId);
             const targets = tokenMapRef.current.get(assetIdStr) || [];
-            
-            if (targets.length === 0) {
-              console.log(`[WS] WARNING: No mapping found for token ${assetIdStr}`);
-              console.log(`[WS] Available tokens in map:`, Array.from(tokenMapRef.current.keys()).slice(0, 10));
-              return;
-            }
-            
-            console.log(`[WS] Token ${assetIdStr} maps to ${targets.length} target(s)`);
-            
+            if (targets.length === 0) return;
+
             targets.forEach(({ eventId, marketId, outcomeIndex }) => {
               const eventIndex = eventIndexById.get(String(eventId));
               if (eventIndex == null) return;
@@ -646,15 +984,6 @@ function App() {
               const prices = parseList(market.outcomePrices);
               const tokens = parseList(market.clobTokenIds);
               const nextPrice = String(update.price);
-              const outcomeName = outcomes[outcomeIndex] || `Outcome ${outcomeIndex}`;
-
-              // Debug logging for India/South Africa markets
-              if (market.question?.includes('India') || market.question?.includes('South Africa')) {
-                console.log(`[WS Update] Token ${update.assetId} -> ${outcomeName} (index ${outcomeIndex})`);
-                console.log(`[WS Update]   Old price: ${prices[outcomeIndex]}, New price: ${nextPrice}`);
-                console.log(`[WS Update]   Expected token at index ${outcomeIndex}: ${tokens[outcomeIndex]}`);
-              }
-
               if (prices[outcomeIndex] !== nextPrice) {
                 prices[outcomeIndex] = nextPrice;
                 market.outcomePrices = prices;
@@ -773,11 +1102,10 @@ function App() {
                 <button
                   key={outcome}
                   onClick={(e) => e.stopPropagation()}
-                  className={`flex-1 flex items-center justify-between px-3 py-2 rounded-md text-sm font-medium border transition-colors ${
-                    i === 0
-                      ? "bg-[#1a3a29] hover:bg-[#1f4532] text-[#4ade80] border-[#2a523a]"
-                      : "bg-[#3a1a1a] hover:bg-[#451f1f] text-[#f87171] border-[#522a2a]"
-                  }`}
+                  className={`flex-1 flex items-center justify-between px-3 py-2 rounded-md text-sm font-medium border transition-colors ${i === 0
+                    ? "bg-[#1a3a29] hover:bg-[#1f4532] text-[#4ade80] border-[#2a523a]"
+                    : "bg-[#3a1a1a] hover:bg-[#451f1f] text-[#f87171] border-[#522a2a]"
+                    }`}
                 >
                   <span className="truncate">{outcome}</span>
                   {prices[i] != null && (
@@ -822,6 +1150,16 @@ function App() {
           seedEvent={selectedEvent}
           liveEvent={activeSelectedEvent}
           onClose={closeModal}
+          orderbookByTokenId={orderbookByTokenId}
+          selectedOutcomeTokenId={selectedOutcomeTokenId}
+          setSelectedOutcomeTokenId={setSelectedOutcomeTokenId}
+          onFetchOrderbook={fetchOrderbook}
+          orderbookTab={orderbookTab}
+          setOrderbookTab={setOrderbookTab}
+          tradeSide={tradeSide}
+          setTradeSide={setTradeSide}
+          tradeAmount={tradeAmount}
+          setTradeAmount={setTradeAmount}
         />
       )}
 
@@ -838,13 +1176,12 @@ function App() {
               <h1 className="ml-3 text-2xl font-extrabold tracking-tight">
                 PolyBridge <span className="text-blue-500">Events</span>
               </h1>
-              <span className={`ml-3 text-[11px] px-2 py-1 rounded-full border ${
-                wsStatus === "live"
-                  ? "text-green-300 border-green-700 bg-green-900/30"
-                  : wsStatus === "connecting" || wsStatus === "reconnecting"
+              <span className={`ml-3 text-[11px] px-2 py-1 rounded-full border ${wsStatus === "live"
+                ? "text-green-300 border-green-700 bg-green-900/30"
+                : wsStatus === "connecting" || wsStatus === "reconnecting"
                   ? "text-yellow-200 border-yellow-700 bg-yellow-900/30"
                   : "text-gray-300 border-gray-700 bg-gray-900/30"
-              }`}>
+                }`}>
                 WS: {wsStatus}
               </span>
             </div>
