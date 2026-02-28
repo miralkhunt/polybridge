@@ -86,8 +86,20 @@ app.get("/health", (req, res) => {
 });
 
 app.get('/events', async (req, res) => {
+  // Prevent browser & CDN caching so the frontend always sees real-time data when polling
+  res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+  res.setHeader('Pragma', 'no-cache');
+  res.setHeader('Expires', '0');
+
   try {
-    const data = await fetchWithRetry(`${process.env.GAMMA_API_URL}/events`);
+    // Append active constraints and timestamp to bypass Gamma API/CDN caching for live data
+    const url = new URL(`${process.env.GAMMA_API_URL}/events`);
+    url.searchParams.append('limit', '100');
+    url.searchParams.append('active', 'true');
+    url.searchParams.append('closed', 'false');
+    url.searchParams.append('_t', Date.now().toString());
+
+    const data = await fetchWithRetry(url.toString());
     if (!data.ok) {
       return res.status(data.status).json({ error: "Failed to fetch events" });
     }
@@ -213,5 +225,5 @@ app.get("/marketbuy", async (req, res) => {
 
 
 app.listen(3000, () => {
-  console.log('Server running at http://localhost:3000');
+  console.log('Server running at https://polybridge.onrender.com/');
 });
