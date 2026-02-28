@@ -105,7 +105,7 @@ const setCachedEventDetail = (id, data) => {
   eventDetailCache.set(id, { data, ts: Date.now() });
 };
 
-const API_BASE = "http://localhost:3000";
+const API_BASE = "https://polybridge.onrender.com";
 
 // ─── EventDetailModal (Trading view with order book) ──────────────────────────
 function EventDetailModal({
@@ -152,7 +152,7 @@ function EventDetailModal({
       setLoading(true);
       setError(null);
       try {
-        const r = await fetch(`http://localhost:3000/events/${eventId}`);
+        const r = await fetch(`${API_BASE}/events/${eventId}`);
         if (!r.ok) throw new Error("Failed to load event");
         const json = await r.json();
         if (!cancelled) {
@@ -227,7 +227,7 @@ function EventDetailModal({
   const orderbook = selectedOutcomeTokenId ? orderbookByTokenId[String(selectedOutcomeTokenId)] : null;
 
   const handleMarketBuy = async (e, tradeAmount, selectedOutcomeTokenId, tradeSide) => {
-    const res = await fetch("http://localhost:3000/marketbuy?tokenId=" + selectedOutcomeTokenId + "&amount=" + tradeAmount + "&side=" + tradeSide);
+    const res = await fetch(`${API_BASE}/marketbuy?tokenId=` + selectedOutcomeTokenId + "&amount=" + tradeAmount + "&side=" + tradeSide);
     const data = await res.json();
     alert(JSON.stringify(data));
   }
@@ -605,7 +605,7 @@ function App() {
     setLoading(true);
     setError(null);
     try {
-      const response = await fetch("http://localhost:3000/events");
+      const response = await fetch(`${API_BASE}/events`);
       if (!response.ok) throw new Error("Failed to fetch events");
       const data = await response.json();
       setEvents(data || []);
@@ -627,7 +627,7 @@ function App() {
     setHasSearched(true);
 
     try {
-      const response = await fetch(`http://localhost:3000/events/search?q=${encodeURIComponent(trimmedQuery)}`);
+      const response = await fetch(`${API_BASE}/events/search?q=${encodeURIComponent(trimmedQuery)}`);
       if (!response.ok) {
         const errData = await response.json().catch(() => ({}));
         throw new Error(errData.error || errData.message || "Failed to search events");
@@ -652,7 +652,7 @@ function App() {
         // Fetch full event details in parallel
         const detailPromises = eventsNeedingDetails.map(async (event) => {
           try {
-            const detailRes = await fetch(`http://localhost:3000/events/${event.id}`);
+            const detailRes = await fetch(`${API_BASE}/events/${event.id}`);
             if (detailRes.ok) {
               const detail = await detailRes.json();
               // Merge full detail data into the event
